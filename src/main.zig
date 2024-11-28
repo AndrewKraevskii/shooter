@@ -42,6 +42,27 @@ pub fn isMapCellEmpty(map: rl.Image, coord: [2]u31) bool {
     return color.r == 0;
 }
 
+pub fn checkCollisionWithMap(map: rl.Image, start: rl.Vector2, end: rl.Vector2, step_size: f32) bool {
+    if (start.x < 0 or start.x >= @as(f32, @floatFromInt(map.width)) or start.y < 0 or start.y >= @as(f32, @floatFromInt(map.height))) {
+        return true;
+    }
+    const step = end.subtract(start).normalize().scale(0.1);
+    var point = start;
+    const times: usize = @max(1, @as(usize, @intFromFloat(end.distance(start) / step_size)));
+    var i: usize = 0;
+    std.debug.assert(times > 0);
+    while (i < times) : ({
+        point = point.add(step);
+        i += 1;
+    }) {
+        const vp: @Vector(2, f32) = @bitCast(point.addValue(0.5));
+        if (!isMapCellEmpty(map, @as(@Vector(2, u31), @intFromFloat(vp)))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn inputDirection() rl.Vector2 {
     var keyboard_vel = rl.Vector2.zero();
     if (rl.isKeyDown(.key_w)) {
@@ -59,11 +80,98 @@ pub fn inputDirection() rl.Vector2 {
     return keyboard_vel.normalize();
 }
 
+const bullet_speed = 10;
+const player_spawn_delay = 0.2;
+const enemy_spawn_delay = 2;
+const respawn_delay = 5;
+const player_speed = 4;
+const player_radius = 0.3;
+const enemy_radius = 0.3;
+const camera_rotation_speed = 0.03;
+
+const Particle = struct {
+    type: enum {
+        bullet,
+        explosion,
+        trail,
+    },
+    size: f32,
+    pos: rl.Vector3,
+    vel: rl.Vector3,
+    ttl: f32,
+};
+
+const GameState = struct {
+    random: std.Random,
+    camera: rl.Camera,
+    spawn_cooldown: f32 = 0,
+    respawn_cooldown: f32 = 0,
+    enemy_spawn_cooldown: f32 = 0,
+    particles: std.BoundedArray(Particle, 0x1000) = .{},
+    mode: enum {
+        pause,
+        playing,
+    } = .playing,
+    player_state: enum {
+        dead,
+        alive,
+        won,
+    } = .alive,
+    enemies: std.BoundedArray(Enemy, 0x30) = .{},
+    enemies_killed: u32 = 0,
+
+    fn init(random: std.Random, map: rl.Image) GameState {
+        var game: GameState = undefined;
+        game.camera = rl.Camera3D{
+            .position = .{ .x = 1, .y = 0.5, .z = 1 },
+            .target = .{ .x = 1, .y = 0, .z = 0 },
+            .up = .{ .x = 0, .y = 1, .z = 0 },
+            .fovy = 90,
+            .projection = .camera_perspective,
+        };
+
+        const player_starting_pos = findEmptySpotOnAMap(random, map, 100);
+        std.debug.print("{any}\n", .{player_starting_pos});
+        if (player_starting_pos) |pos| {
+            game.camera.position = .{
+                .x = pos.x,
+                .z = pos.y,
+                .y = 0.5,
+            };
+            game.camera.target = game.camera.position.add(.{
+                .x = (random.float(f32) * 2 - 1),
+                .z = (random.float(f32) * 2 - 1),
+                .y = 0,
+            });
+        }
+        game.particles = .{};
+
+        game.mode = .playing;
+
+        game.player_state = .alive;
+
+        game.enemies = .{};
+        game.enemies.appendAssumeCapacity(.{
+            .pos = (findEmptySpotOnAMap(random, map, null) orelse @panic("Cant find spot on a map")).addValue(0.5),
+            .animation_count = 4,
+            .animation_index = 0,
+        });
+        game.enemies_killed = 0;
+        return game;
+    }
+};
+
+const Enemy = struct {
+    pos: rl.Vector2,
+    animation_count: u8,
+    animation_index: u8,
+    projectile_cooldown: f32 = 2,
+    projectile_delay: f32 = 2,
+};
+
 pub fn main() anyerror!void {
     const screenWidth = 800;
     const screenHeight = 450;
-    var random_impl = std.Random.DefaultPrng.init(0);
-    const random = random_impl.random();
 
     rl.setConfigFlags(.{
         .window_resizable = true,
@@ -77,16 +185,24 @@ pub fn main() anyerror!void {
     rl.disableCursor();
     defer rl.closeWindow();
 
-    rl.setTargetFPS(60);
+    // rl.setTargetFPS(60);
 
     rl.initAudioDevice();
     defer rl.closeAudioDevice();
+
+    var random_impl = std.Random.DefaultPrng.init(0);
+    const random = random_impl.random();
+    const map = rl.loadImage("res/cubicmap.png");
+
+    var game = GameState.init(
+        random,
+        map,
+    );
 
     const rocket_sound = rl.loadSound("res/rocket.wav");
     rl.setSoundVolume(rocket_sound, 0.5);
     const explosion_sound = rl.loadSound("res/explosion.wav");
     rl.setSoundVolume(explosion_sound, 0.5);
-    const map = rl.loadImage("res/cubicmap.png");
     const texture = rl.loadTexture("res/cubicmap_atlas.png"); // Load map texture
     const enemy_sprite = rl.loadTexture("res/monster.png");
     const screams = [_]rl.Sound{
@@ -95,96 +211,20 @@ pub fn main() anyerror!void {
     };
 
     const map_scale = 10;
-    const player_starting_pos = findEmptySpotOnAMap(random, map, 100);
-    std.debug.print("{any}\n", .{player_starting_pos});
     const map_texture = rl.loadTextureFromImage(map);
     const mesh = rl.genMeshCubicmap(map, .one());
     const model = rl.loadModelFromMesh(mesh);
 
     model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.material_map_albedo)].texture = texture; // Set map diffuse texture    _ = mesh; // autofix
-
-    // Main game loop
-    var camera = rl.Camera3D{
-        .position = .{ .x = 1, .y = 0.5, .z = 1 },
-        .target = .{ .x = 1, .y = 0, .z = 0 },
-        .up = .{ .x = 0, .y = 1, .z = 0 },
-        .fovy = 90,
-        .projection = .camera_perspective,
-    };
-
-    if (player_starting_pos) |pos| {
-        camera.position = .{
-            .x = pos.x,
-            .z = pos.y,
-            .y = 0.5,
-        };
-        camera.target = camera.position.add(.{
-            .x = (random.float(f32) * 2 - 1),
-            .z = (random.float(f32) * 2 - 1),
-            .y = 0,
-        });
-    }
-    const bullet_speed = 10;
-    var spawn_cooldown: f32 = 0;
-    const player_spawn_delay = 0.2;
-    var respawn_cooldown: f32 = 0;
-    const enemy_spawn_delay = 2;
-    var enemy_spawn_cooldown: f32 = 0;
-    const respawn_delay = 5;
-    const player_speed = 4;
-    const player_radius = 0.3;
-    const enemy_radius = 0.3;
-    const camera_rotation_speed = 0.03;
-
-    const Particle = struct {
-        type: enum {
-            bullet,
-            explosion,
-            trail,
-        },
-        size: f32,
-        pos: rl.Vector3,
-        vel: rl.Vector3,
-        ttl: f32,
-    };
-    var particles: std.BoundedArray(Particle, 0x1000) = .{};
-
-    var mode: enum {
-        pause,
-        playing,
-    } = .playing;
-
-    var player_state: enum {
-        dead,
-        alive,
-        won,
-    } = .alive;
-
-    const Enemy = struct {
-        pos: rl.Vector2,
-        animation_count: u8,
-        animation_index: u8,
-        sprite_sheet: rl.Texture,
-        projectile_cooldown: f32 = 2,
-        projectile_delay: f32 = 2,
-    };
-    var enemies: std.BoundedArray(Enemy, 0x30) = .{};
-    enemies.appendAssumeCapacity(.{
-        .pos = (findEmptySpotOnAMap(random, map, null) orelse @panic("Cant find spot on a map")).addValue(0.5),
-        .animation_count = 4,
-        .animation_index = 0,
-        .sprite_sheet = enemy_sprite,
-    });
     const player_respawn_delay = 3;
 
-    var enemies_killed: u32 = 0;
     const enemies_killed_goal = 30;
 
     while (!rl.windowShouldClose()) {
-        if (mode == .playing and player_state != .won) {
-            if (player_state == .alive) { // update player movement
+        if (game.mode == .playing and game.player_state != .won) {
+            if (game.player_state == .alive) { // update player movement
                 const delta = rl.getMouseDelta();
-                rl.updateCameraPro(&camera, .zero(), .{
+                rl.updateCameraPro(&game.camera, .zero(), .{
                     .x = delta.x * camera_rotation_speed,
                     .y = delta.y * camera_rotation_speed,
                     .z = 0,
@@ -192,7 +232,7 @@ pub fn main() anyerror!void {
 
                 const keyboard_direction = inputDirection();
 
-                const camera_forward = cameraForward(camera);
+                const camera_forward = cameraForward(game.camera);
                 const camera_forward_2d = to2dPlane(camera_forward).normalize();
                 const camera_right = rl.Vector2{ .x = -camera_forward_2d.y, .y = camera_forward_2d.x };
 
@@ -203,7 +243,7 @@ pub fn main() anyerror!void {
                 const new_direction = for (0..3) |_| {
                     const collision = rl.getRayCollisionMesh(
                         .{
-                            .position = camera.position,
+                            .position = game.camera.position,
                             .direction = dir,
                         },
                         mesh,
@@ -222,24 +262,24 @@ pub fn main() anyerror!void {
                         break dir;
                 } else unreachable;
                 const camera_movement = new_direction.scale(walk_distance_this_frame);
-                camera.position = camera.position.add(camera_movement);
-                camera.target = camera.target.add(camera_movement);
+                game.camera.position = game.camera.position.add(camera_movement);
+                game.camera.target = game.camera.target.add(camera_movement);
             } else {
-                respawn_cooldown -= rl.getFrameTime();
-                if (respawn_cooldown < 0) blk: {
-                    player_state = .alive;
+                game.respawn_cooldown -= rl.getFrameTime();
+                if (game.respawn_cooldown < 0) blk: {
+                    game.player_state = .alive;
 
-                    for (enemies.slice()) |*enemy| {
+                    for (game.enemies.slice()) |*enemy| {
                         enemy.projectile_cooldown = player_respawn_delay;
                     }
 
                     const new_player_pos = findEmptySpotOnAMap(random, map, 100) orelse break :blk;
-                    camera.position = .{
+                    game.camera.position = .{
                         .x = new_player_pos.x,
                         .z = new_player_pos.y,
                         .y = 0.5,
                     };
-                    camera.target = camera.position.add(.{
+                    game.camera.target = game.camera.position.add(.{
                         .x = (random.float(f32) * 2 - 1),
                         .z = (random.float(f32) * 2 - 1),
                         .y = 0,
@@ -247,68 +287,60 @@ pub fn main() anyerror!void {
                 }
             }
             { // spawn enemy
-                enemy_spawn_cooldown -= rl.getFrameTime();
-                if (enemy_spawn_cooldown < 0) {
-                    enemy_spawn_cooldown = enemy_spawn_delay;
-                    enemies.append(.{
+                game.enemy_spawn_cooldown -= rl.getFrameTime();
+                if (game.enemy_spawn_cooldown < 0) {
+                    game.enemy_spawn_cooldown = enemy_spawn_delay;
+                    game.enemies.append(.{
                         .pos = (findEmptySpotOnAMap(random, map, null) orelse @panic("Cant find spot on a map")).addValue(0),
                         .animation_count = 4,
                         .animation_index = 0,
-                        .sprite_sheet = enemy_sprite,
                     }) catch {};
                 }
             }
             { // update enemy
-                for (enemies.slice()) |*enemy| {
+                for (game.enemies.slice()) |*enemy| {
                     const enemy_pos = to3d(enemy.pos);
-                    const enemy_direciton = camera.position.subtract(enemy_pos).normalize();
-                    const collision = rl.getRayCollisionMesh(
-                        .{
-                            .position = enemy_pos,
-                            .direction = enemy_direciton,
-                        },
-                        mesh,
-                        .identity(),
-                    );
+                    const enemy_direciton = game.camera.position.subtract(enemy_pos).normalize();
                     enemy.projectile_cooldown -= rl.getFrameTime();
+
                     if (enemy.projectile_cooldown < 0 and
-                        player_state == .alive and
-                        collision.hit and
-                        collision.distance >= enemy_pos.distance(camera.position))
+                        game.player_state == .alive)
                     {
-                        if (particles.append(.{
-                            .type = .bullet,
-                            .ttl = 10,
-                            .pos = enemy_pos,
-                            .vel = enemy_direciton.scale(bullet_speed),
-                            .size = 0.1,
-                        })) {
-                            rl.playSound(rocket_sound);
-                        } else |_| {}
-                        enemy.projectile_cooldown = enemy.projectile_delay;
+                        const found_wall_on_the_way = checkCollisionWithMap(map, enemy.pos, to2dPlane(game.camera.position), 0.1);
+                        if (!found_wall_on_the_way) {
+                            if (game.particles.append(.{
+                                .type = .bullet,
+                                .ttl = 10,
+                                .pos = enemy_pos,
+                                .vel = enemy_direciton.scale(bullet_speed),
+                                .size = 0.1,
+                            })) {
+                                rl.playSound(rocket_sound);
+                            } else |_| {}
+                            enemy.projectile_cooldown = enemy.projectile_delay;
+                        }
                     }
                 }
-                enemy_spawn_cooldown -= rl.getFrameTime();
-                if (enemy_spawn_cooldown < 0) {
-                    enemy_spawn_cooldown = enemy_spawn_delay;
-                    enemies.append(.{
+                game.enemy_spawn_cooldown -= rl.getFrameTime();
+                if (game.enemy_spawn_cooldown < 0) {
+                    game.enemy_spawn_cooldown = enemy_spawn_delay;
+                    game.enemies.append(.{
                         .pos = (findEmptySpotOnAMap(random, map, null) orelse @panic("Cant find spot on a map")).addValue(0),
                         .animation_count = 4,
                         .animation_index = 0,
-                        .sprite_sheet = enemy_sprite,
                     }) catch {};
                 }
             }
             { // update particles
-                spawn_cooldown -= rl.getFrameTime();
-                if (rl.isMouseButtonDown(.mouse_button_left) and player_state == .alive) {
-                    if (spawn_cooldown < 0) {
-                        spawn_cooldown = player_spawn_delay;
-                        if (particles.append(.{
+                game.spawn_cooldown -= rl.getFrameTime();
+                if (rl.isMouseButtonDown(.mouse_button_left) and game.player_state == .alive) {
+                    if (game.spawn_cooldown < 0) {
+                        game.spawn_cooldown = player_spawn_delay;
+                        if (game.particles.append(.{
                             .type = .bullet,
                             .ttl = 10,
-                            .pos = camera.position,
-                            .vel = cameraForward(camera).scale(bullet_speed),
+                            .pos = game.camera.position,
+                            .vel = cameraForward(game.camera).scale(bullet_speed),
                             .size = 0.1,
                         })) {
                             rl.playSound(rocket_sound);
@@ -317,29 +349,25 @@ pub fn main() anyerror!void {
                 }
 
                 var i: usize = 0;
-                while (i < particles.len) {
-                    particles.slice()[i].ttl -= rl.getFrameTime();
-                    if (particles.get(i).ttl < 0) {
-                        _ = particles.swapRemove(i);
+                while (i < game.particles.len) {
+                    game.particles.slice()[i].ttl -= rl.getFrameTime();
+                    if (game.particles.get(i).ttl < 0) {
+                        _ = game.particles.swapRemove(i);
                         continue;
                     }
-                    const particle = &particles.slice()[i];
+                    const particle = &game.particles.slice()[i];
 
                     i += 1;
 
                     switch (particle.type) {
                         .bullet => {
                             const travel_ray = particle.vel.scale(rl.getFrameTime());
-                            const collision = rl.getRayCollisionMesh(
-                                .{
-                                    .position = particle.pos,
-                                    .direction = travel_ray.normalize(),
-                                },
-                                mesh,
-                                .identity(),
-                            );
+                            const destenation = particle.pos.add(travel_ray);
+                            const colided_with_the_wall = checkCollisionWithMap(map, to2dPlane(particle.pos), to2dPlane(particle.pos.add(travel_ray)), 0.01);
 
-                            if (collision.hit and collision.distance <= travel_ray.length()) {
+                            const colided_with_floor = destenation.y < 0;
+                            const colided_with_ceiling = destenation.y > 1;
+                            if (colided_with_the_wall or colided_with_floor or colided_with_ceiling) {
                                 rl.playSound(explosion_sound);
                                 particle.* = .{
                                     .type = .explosion,
@@ -350,7 +378,7 @@ pub fn main() anyerror!void {
                                 };
                                 continue;
                             } else {
-                                particles.append(.{
+                                game.particles.append(.{
                                     .ttl = 0.2,
                                     .type = .trail,
                                     .pos = particle.pos,
@@ -369,17 +397,18 @@ pub fn main() anyerror!void {
 
                             {
                                 var index: usize = 0;
-                                while (index < enemies.len) {
+                                while (index < game.enemies.len) {
                                     if (rl.checkCollisionSpheres(
                                         particle.pos,
                                         particle.size,
-                                        to3d(enemies.slice()[index].pos),
+                                        to3d(game.enemies.slice()[index].pos),
                                         enemy_radius,
                                     )) {
-                                        _ = enemies.swapRemove(index);
-                                        enemies_killed += 1;
-                                        if (enemies_killed == enemies_killed_goal) {
-                                            player_state = .won;
+                                        _ = game.enemies.swapRemove(index);
+                                        game.enemies_killed += 1;
+                                        if (game.enemies_killed == enemies_killed_goal) {
+                                            game.player_state = .won;
+                                            rl.enableCursor();
                                         }
                                         continue;
                                     }
@@ -390,14 +419,14 @@ pub fn main() anyerror!void {
                             if (rl.checkCollisionSpheres(
                                 particle.pos,
                                 particle.size,
-                                camera.position,
+                                game.camera.position,
                                 player_radius,
-                            ) and player_state != .dead) {
+                            ) and game.player_state != .dead) {
                                 const scream_index = random.intRangeLessThanBiased(usize, 0, screams.len);
                                 rl.playSound(screams[scream_index]);
                                 std.log.info("Player died", .{});
-                                player_state = .dead;
-                                respawn_cooldown = respawn_delay;
+                                game.player_state = .dead;
+                                game.respawn_cooldown = respawn_delay;
                             }
                         },
                         .trail => {
@@ -414,12 +443,12 @@ pub fn main() anyerror!void {
         rl.clearBackground(.black);
 
         { // draw world
-            camera.begin();
-            defer camera.end();
+            game.camera.begin();
+            defer game.camera.end();
 
             rl.drawModel(model, .zero(), 1, .white);
 
-            for (particles.slice()) |particle| {
+            for (game.particles.slice()) |particle| {
                 switch (particle.type) {
                     .bullet => rl.drawSphere(particle.pos, particle.size, .red),
                     .explosion => rl.drawSphere(particle.pos, particle.size, .yellow),
@@ -428,16 +457,16 @@ pub fn main() anyerror!void {
                     },
                 }
             }
-            for (enemies.slice()) |*enemy| {
-                const single_width = @as(u32, @intCast(enemy.sprite_sheet.width)) / enemy.animation_count;
+            for (game.enemies.slice()) |*enemy| {
+                const single_width = @as(u32, @intCast(enemy_sprite.width)) / enemy.animation_count;
                 const source: rl.Rectangle = .{
                     .x = @floatFromInt(single_width * enemy.animation_index),
                     .y = 0,
                     .width = @floatFromInt(single_width),
-                    .height = @floatFromInt(enemy.sprite_sheet.height),
+                    .height = @floatFromInt(enemy_sprite.height),
                 };
                 enemy.animation_index = @intFromFloat(@mod(rl.getTime() * 10, @as(f64, @floatFromInt(enemy.animation_count))));
-                rl.drawBillboardRec(camera, enemy.sprite_sheet, source, to3d(enemy.pos), .one(), .white);
+                rl.drawBillboardRec(game.camera, enemy_sprite, source, to3d(enemy.pos), .one(), .white);
             }
         }
         const center_x = @divFloor(rl.getScreenWidth(), 2);
@@ -445,34 +474,43 @@ pub fn main() anyerror!void {
         { // draw ui
             map_texture.drawEx(.init(0, 0), 0, map_scale, rl.Color.white.alpha(0.3));
             rl.drawCircleV(
-                to2dPlane(camera.position).scale(map_scale),
+                to2dPlane(game.camera.position).scale(map_scale),
                 10,
                 .red,
             );
-            for (enemies.slice()) |enemy| {
+            for (game.enemies.slice()) |enemy| {
                 rl.drawCircleV(enemy.pos.addValue(0.5).scale(map_scale), 3, .blue);
             }
             {
                 var buffer: [0x100]u8 = undefined;
-                const text = std.fmt.bufPrintZ(&buffer, "Killed enemies: {d}/{d}", .{ enemies_killed, enemies_killed_goal }) catch unreachable;
+                const text = std.fmt.bufPrintZ(&buffer, "Killed enemies: {d}/{d}", .{ game.enemies_killed, enemies_killed_goal }) catch unreachable;
                 rl.drawText(text, 10, map_scale * map.height + 10, 30, .white);
             }
 
             rl.drawRectangleLines(center_x - 5, center_y - 5, 10, 10, .black);
 
-            if (player_state == .dead) {
+            if (game.player_state == .dead) {
                 drawTextCentered("You are dead", center_x, center_y, 50, .red);
                 var buffer: [0x100]u8 = undefined;
-                const respawn_text = std.fmt.bufPrintZ(&buffer, "respawn in {d:0.2}", .{respawn_cooldown}) catch unreachable;
+                const respawn_text = std.fmt.bufPrintZ(&buffer, "respawn in {d:0.2}", .{game.respawn_cooldown}) catch unreachable;
                 drawTextCentered(respawn_text, center_x, center_y + 60, 40, .white);
             }
-            if (player_state == .won) {
+            if (game.player_state == .won) {
                 drawTextCentered("Congratulations you won", center_x, center_y, 50, .red);
-                // if (rgui.guiButton("Restart") != 0) {}
+
+                if (rgui.guiButton(.{
+                    .x = @as(f32, @floatFromInt(center_x)) - 50,
+                    .y = @floatFromInt(center_y + 60),
+                    .width = 100,
+                    .height = 30,
+                }, "Restart?") != 0) {
+                    game = .init(random, map);
+                    rl.disableCursor();
+                }
             }
         }
 
-        if (mode == .pause) {
+        if (game.mode == .pause) {
             drawBackdrop(rl.Color.black.alpha(0.4));
             drawTextCentered(
                 "Paused",
@@ -521,18 +559,19 @@ pub fn main() anyerror!void {
         }
 
         if (rl.isKeyPressed(.key_escape)) {
-            switch (mode) {
+            switch (game.mode) {
                 .pause => {
                     rl.disableCursor();
-                    mode = .playing;
+                    game.mode = .playing;
                 },
                 .playing => {
                     rl.enableCursor();
-                    mode = .pause;
+                    game.mode = .pause;
                 },
             }
         }
 
+        std.log.debug("frame time {d}", .{rl.getFrameTime()});
         rl.drawFPS(0, 0);
     }
 }
