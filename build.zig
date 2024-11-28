@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
 
+    b.installDirectory(.{
+        .source_dir = b.path("res"),
+        .install_subdir = "res",
+        .install_dir = .bin,
+    });
+
     run_cmd.step.dependOn(b.getInstallStep());
 
     if (b.args) |args| {

@@ -215,7 +215,7 @@ pub fn main() anyerror!void {
     const mesh = rl.genMeshCubicmap(map, .one());
     const model = rl.loadModelFromMesh(mesh);
 
-    model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.material_map_albedo)].texture = texture; // Set map diffuse texture    _ = mesh; // autofix
+    model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.material_map_albedo)].texture = texture; // Set map diffuse texture
     const player_respawn_delay = 3;
 
     const enemies_killed_goal = 30;
@@ -300,7 +300,7 @@ pub fn main() anyerror!void {
             { // update enemy
                 for (game.enemies.slice()) |*enemy| {
                     const enemy_pos = to3d(enemy.pos);
-                    const enemy_direciton = game.camera.position.subtract(enemy_pos).normalize();
+                    const enemy_direction = game.camera.position.subtract(enemy_pos).normalize();
                     enemy.projectile_cooldown -= rl.getFrameTime();
 
                     if (enemy.projectile_cooldown < 0 and
@@ -312,7 +312,7 @@ pub fn main() anyerror!void {
                                 .type = .bullet,
                                 .ttl = 10,
                                 .pos = enemy_pos,
-                                .vel = enemy_direciton.scale(bullet_speed),
+                                .vel = enemy_direction.scale(bullet_speed),
                                 .size = 0.1,
                             })) {
                                 rl.playSound(rocket_sound);
@@ -363,11 +363,11 @@ pub fn main() anyerror!void {
                         .bullet => {
                             const travel_ray = particle.vel.scale(rl.getFrameTime());
                             const destenation = particle.pos.add(travel_ray);
-                            const colided_with_the_wall = checkCollisionWithMap(map, to2dPlane(particle.pos), to2dPlane(particle.pos.add(travel_ray)), 0.01);
+                            const collided_with_the_wall = checkCollisionWithMap(map, to2dPlane(particle.pos), to2dPlane(particle.pos.add(travel_ray)), 0.05);
 
-                            const colided_with_floor = destenation.y < 0;
-                            const colided_with_ceiling = destenation.y > 1;
-                            if (colided_with_the_wall or colided_with_floor or colided_with_ceiling) {
+                            const collided_with_floor = destenation.y < 0;
+                            const collided_with_ceiling = destenation.y > 1;
+                            if (collided_with_the_wall or collided_with_floor or collided_with_ceiling) {
                                 rl.playSound(explosion_sound);
                                 particle.* = .{
                                     .type = .explosion,
