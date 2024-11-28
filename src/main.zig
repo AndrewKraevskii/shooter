@@ -37,7 +37,10 @@ pub fn findEmptySpotOnAMap(random: std.Random, map: rl.Image, max_attempts: ?u32
 }
 
 pub fn isMapCellEmpty(map: rl.Image, coord: [2]i32) bool {
-    if (coord[0] < 0 or coord[1] < 0) return false;
+    if (coord[0] < 0 or
+        coord[1] < 0 or
+        coord[0] > map.width or
+        coord[1] > map.height) return false;
     const color = map.getColor(coord[0], coord[1]);
 
     return color.r == 0;
@@ -45,6 +48,9 @@ pub fn isMapCellEmpty(map: rl.Image, coord: [2]i32) bool {
 
 pub fn checkCollisionWithMap(map: rl.Image, start: rl.Vector2, end: rl.Vector2, step_size: f32) bool {
     if (start.x < 0 or start.x >= @as(f32, @floatFromInt(map.width)) or start.y < 0 or start.y >= @as(f32, @floatFromInt(map.height))) {
+        return true;
+    }
+    if (end.x < 0 or end.x >= @as(f32, @floatFromInt(map.width)) or end.y < 0 or end.y >= @as(f32, @floatFromInt(map.height))) {
         return true;
     }
     const step = end.subtract(start).normalize().scale(step_size);
@@ -56,8 +62,10 @@ pub fn checkCollisionWithMap(map: rl.Image, start: rl.Vector2, end: rl.Vector2, 
         point = point.add(step);
         i += 1;
     }) {
-        const vp: @Vector(2, f32) = @bitCast(point);
-        if (!isMapCellEmpty(map, @as(@Vector(2, u31), @intFromFloat(vp)))) {
+        if (!isMapCellEmpty(map, .{
+            @intFromFloat(point.x),
+            @intFromFloat(point.y),
+        })) {
             return true;
         }
     }
@@ -90,7 +98,8 @@ const player_radius = 0.3;
 const enemy_radius = 0.3;
 const camera_rotation_speed = 0.03;
 const enemy_from_player_spawn_distance = 5;
-const monsters_move = false;
+const monsters_move = true;
+const invulnerability = false;
 
 const Particle = struct {
     type: enum {
@@ -180,7 +189,7 @@ pub fn main() !void {
         .window_resizable = true,
         .msaa_4x_hint = true,
     });
-    rl.initWindow(screenWidth, screenHeight, "raylib-zig [core] example - basic window");
+    rl.initWindow(screenWidth, screenHeight, "Explosion shooter");
     rl.setExitKey(.key_null);
     rgui.guiSetStyle(.default, 16, 25);
     rgui.guiSetStyle(.default, 1, @bitCast(rl.Color.white));
@@ -299,7 +308,9 @@ pub fn main() !void {
                     const spawn_position = for (0..10) |_| {
                         const potential_spawn_point = (findEmptySpotOnAMap(random, map, 100) orelse break :blk).addValue(0.5);
 
-                        if (checkCollisionWithMap(map, potential_spawn_point, toMap(game.camera.position), 0.01)) {
+                        if (checkCollisionWithMap(map, potential_spawn_point, toMap(game.camera.position), 0.01) and
+                            checkCollisionWithMap(map, potential_spawn_point.add(.{ .x = 0.023342, .y = -0.01 }), toMap(game.camera.position), 0.01))
+                        {
                             break potential_spawn_point;
                         } else {
                             try potential_spawn_spots.append(arena.allocator(), potential_spawn_point);
@@ -315,6 +326,15 @@ pub fn main() !void {
             }
             { // update enemy
                 for (game.enemies.slice()) |*enemy| {
+                    const degree = random.float(f32) * std.math.tau;
+
+                    game.particles.append(.{
+                        .ttl = 0.3,
+                        .type = .trail,
+                        .size = 0.01,
+                        .pos = toWorld(enemy.pos),
+                        .vel = .init(@sin(degree), 0, @cos(degree)),
+                    }) catch {};
                     const enemy_pos = toWorld(enemy.pos);
                     const enemy_direction = game.camera.position.subtract(enemy_pos).normalize();
                     enemy.projectile_cooldown -= rl.getFrameTime();
@@ -322,7 +342,7 @@ pub fn main() !void {
                     if (enemy.projectile_cooldown < 0 and
                         game.player_state == .alive)
                     {
-                        const found_wall_on_the_way = checkCollisionWithMap(map, enemy.pos, toMap(game.camera.position), 0.01);
+                        const found_wall_on_the_way = checkCollisionWithMap(map, enemy.pos, toMap(game.camera.position), 0.001);
                         if (!found_wall_on_the_way) {
                             if (game.particles.append(.{
                                 .type = .bullet,
@@ -459,7 +479,9 @@ pub fn main() !void {
                                 const scream_index = random.intRangeLessThanBiased(usize, 0, screams.len);
                                 rl.playSound(screams[scream_index]);
                                 std.log.info("Player died", .{});
-                                // game.player_state = .dead;
+                                if (!invulnerability) {
+                                    game.player_state = .dead;
+                                }
                                 game.respawn_cooldown = respawn_delay;
                             }
                         },
