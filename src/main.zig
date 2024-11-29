@@ -119,7 +119,7 @@ const GameState = struct {
     spawn_cooldown: f32 = 0,
     respawn_cooldown: f32 = 0,
     enemy_spawn_cooldown: f32 = 0,
-    particles: std.BoundedArray(Particle, 0x1000) = .{},
+    particles: std.ArrayListUnmanaged(Particle) = .{},
     mode: enum {
         pause,
         playing,
@@ -132,7 +132,7 @@ const GameState = struct {
     enemies: std.BoundedArray(Enemy, 0x30) = .{},
     enemies_killed: u32 = 0,
 
-    fn init(random: std.Random, map: rl.Image) GameState {
+    fn init(arena: std.mem.Allocator, random: std.Random, map: rl.Image) !GameState {
         var game: GameState = undefined;
 
         const player_starting_pos = (findEmptySpotOnAMap(random, map, 100) orelse @panic("cant file place on map for player")).addValue(0.5);
@@ -156,6 +156,7 @@ const GameState = struct {
         game.player_state = .alive;
 
         game.particles = .{};
+        try game.particles.ensureTotalCapacityPrecise(arena, 0x1000);
         game.enemies = .{};
         game.enemies.appendAssumeCapacity(.{
             .pos = (findEmptySpotOnAMap(random, map, null) orelse @panic("Cant find spot on a map")).addValue(0.5),
@@ -181,6 +182,8 @@ const Enemy = struct {
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
+    var game_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer game_arena.deinit();
 
     const screenWidth = 800;
     const screenHeight = 450;
@@ -205,7 +208,8 @@ pub fn main() !void {
     const random = random_impl.random();
     const map = rl.loadImage("res/cubicmap.png");
 
-    var game = GameState.init(
+    var game = try GameState.init(
+        game_arena.allocator(),
         random,
         map,
     );
@@ -225,7 +229,8 @@ pub fn main() !void {
     const map_texture = rl.loadTextureFromImage(map);
     const mesh = rl.genMeshCubicmap(map, .one());
     const model = rl.loadModelFromMesh(mesh);
-
+    const sphere_mesh = rl.genMeshSphere(1, 5, 5);
+    const mat_instances = rl.loadMaterialDefault();
     model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.material_map_albedo)].texture = texture; // Set map diffuse texture
     const player_respawn_delay = 3;
 
@@ -234,6 +239,7 @@ pub fn main() !void {
     _ = arena.reset(.retain_capacity);
     var potential_spawn_spots = std.ArrayListUnmanaged(rl.Vector2).empty;
     while (!rl.windowShouldClose()) {
+        _ = arena.reset(.retain_capacity);
         if (game.mode == .playing and game.player_state != .won) {
             if (game.player_state == .alive) { // update player movement
                 const delta = rl.getMouseDelta();
@@ -328,13 +334,15 @@ pub fn main() !void {
                 for (game.enemies.slice()) |*enemy| {
                     const degree = random.float(f32) * std.math.tau;
 
-                    game.particles.append(.{
-                        .ttl = 0.3,
-                        .type = .trail,
-                        .size = 0.01,
-                        .pos = toWorld(enemy.pos),
-                        .vel = .init(@sin(degree), 0, @cos(degree)),
-                    }) catch {};
+                    if (game.particles.unusedCapacitySlice().len != 0) {
+                        game.particles.appendAssumeCapacity(.{
+                            .ttl = 0.3,
+                            .type = .trail,
+                            .size = 0.01,
+                            .pos = toWorld(enemy.pos),
+                            .vel = .init(@sin(degree), 0, @cos(degree)),
+                        });
+                    }
                     const enemy_pos = toWorld(enemy.pos);
                     const enemy_direction = game.camera.position.subtract(enemy_pos).normalize();
                     enemy.projectile_cooldown -= rl.getFrameTime();
@@ -344,15 +352,16 @@ pub fn main() !void {
                     {
                         const found_wall_on_the_way = checkCollisionWithMap(map, enemy.pos, toMap(game.camera.position), 0.1);
                         if (!found_wall_on_the_way) {
-                            if (game.particles.append(.{
-                                .type = .bullet,
-                                .ttl = 10,
-                                .pos = enemy_pos,
-                                .vel = enemy_direction.scale(bullet_speed),
-                                .size = 0.1,
-                            })) {
+                            if (game.particles.unusedCapacitySlice().len != 0) {
+                                game.particles.appendAssumeCapacity(.{
+                                    .type = .bullet,
+                                    .ttl = 10,
+                                    .pos = enemy_pos,
+                                    .vel = enemy_direction.scale(bullet_speed),
+                                    .size = 0.1,
+                                });
                                 rl.playSound(rocket_sound);
-                            } else |_| {}
+                            }
                             enemy.projectile_cooldown = enemy.projectile_delay;
                         }
                     }
@@ -390,26 +399,28 @@ pub fn main() !void {
                 if (rl.isMouseButtonDown(.mouse_button_left) and game.player_state == .alive) {
                     if (game.spawn_cooldown < 0) {
                         game.spawn_cooldown = player_spawn_delay;
-                        if (game.particles.append(.{
-                            .type = .bullet,
-                            .ttl = 10,
-                            .pos = game.camera.position,
-                            .vel = cameraForward(game.camera).scale(bullet_speed),
-                            .size = 0.1,
-                        })) {
+                        if (game.particles.unusedCapacitySlice().len != 0) {
+                            game.particles.appendAssumeCapacity(.{
+                                .type = .bullet,
+                                .ttl = 10,
+                                .pos = game.camera.position,
+                                .vel = cameraForward(game.camera).scale(bullet_speed),
+                                .size = 0.1,
+                            });
                             rl.playSound(rocket_sound);
-                        } else |_| {}
+                        }
                     }
                 }
 
                 var i: usize = 0;
-                while (i < game.particles.len) {
-                    game.particles.slice()[i].ttl -= rl.getFrameTime();
-                    if (game.particles.get(i).ttl < 0) {
+                std.log.debug("{d}", .{game.particles.items.len});
+                while (i < game.particles.items.len) {
+                    game.particles.items[i].ttl -= rl.getFrameTime();
+                    if (game.particles.items[i].ttl < 0) {
                         _ = game.particles.swapRemove(i);
                         continue;
                     }
-                    const particle = &game.particles.slice()[i];
+                    const particle = &game.particles.items[i];
 
                     i += 1;
 
@@ -432,17 +443,18 @@ pub fn main() !void {
                                 };
                                 continue;
                             } else {
-                                game.particles.append(.{
-                                    .ttl = 0.2,
-                                    .type = .trail,
-                                    .pos = particle.pos,
-                                    .size = 0.01,
-                                    .vel = .init(
-                                        (random.float(f32) * 2 - 1) * 0.3,
-                                        (random.float(f32) * 2 - 1) * 0.3,
-                                        (random.float(f32) * 2 - 1) * 0.3,
-                                    ),
-                                }) catch {};
+                                if (game.particles.unusedCapacitySlice().len != 0)
+                                    game.particles.appendAssumeCapacity(.{
+                                        .ttl = 0.2,
+                                        .type = .trail,
+                                        .pos = particle.pos,
+                                        .size = 0.01,
+                                        .vel = .init(
+                                            (random.float(f32) * 2 - 1) * 0.3,
+                                            (random.float(f32) * 2 - 1) * 0.3,
+                                            (random.float(f32) * 2 - 1) * 0.3,
+                                        ),
+                                    });
                                 particle.pos = particle.pos.add(particle.vel.scale(rl.getFrameTime()));
                             }
                         },
@@ -504,12 +516,39 @@ pub fn main() !void {
 
             rl.drawModel(model, .init(0.5, 0, 0.5), 1, .white);
 
-            for (game.particles.slice()) |particle| {
+            for (game.particles.items) |particle| {
                 switch (particle.type) {
-                    .bullet => rl.drawSphere(particle.pos, particle.size, .red),
+                    .bullet => {
+                        mat_instances.maps[@intFromEnum(rl.MaterialMapIndex.material_map_albedo)].color = .red;
+                        sphere_mesh.draw(
+                            mat_instances,
+                            rl.Matrix.scale(
+                                particle.size,
+                                particle.size,
+                                particle.size,
+                            ).multiply(.translate(
+                                particle.pos.x,
+                                particle.pos.y,
+                                particle.pos.z,
+                            )),
+                        );
+                    },
                     .explosion => rl.drawSphere(particle.pos, particle.size, .yellow),
                     .trail => {
-                        rl.drawSphere(particle.pos, particle.size, .blue);
+                        mat_instances.maps[@intFromEnum(rl.MaterialMapIndex.material_map_albedo)].color = .blue;
+                        sphere_mesh.draw(
+                            mat_instances,
+                            rl.Matrix.scale(
+                                particle.size,
+                                particle.size,
+                                particle.size,
+                            ).multiply(.translate(
+                                particle.pos.x,
+                                particle.pos.y,
+                                particle.pos.z,
+                            )),
+                        );
+                        // rl.drawSphere(particle.pos, particle.size, .blue);
                     },
                 }
             }
@@ -568,7 +607,8 @@ pub fn main() !void {
                     .width = 100,
                     .height = 30,
                 }, "Restart?") != 0) {
-                    game = .init(random, map);
+                    _ = game_arena.reset(.retain_capacity);
+                    game = try .init(game_arena.allocator(), random, map);
                     rl.disableCursor();
                 }
             }
