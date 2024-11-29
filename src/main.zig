@@ -309,7 +309,7 @@ pub fn main() !void {
                         const potential_spawn_point = (findEmptySpotOnAMap(random, map, 100) orelse break :blk).addValue(0.5);
 
                         if (checkCollisionWithMap(map, potential_spawn_point, toMap(game.camera.position), 0.01) and
-                            checkCollisionWithMap(map, potential_spawn_point.add(.{ .x = 0.023342, .y = -0.01 }), toMap(game.camera.position), 0.01))
+                            checkCollisionWithMap(map, potential_spawn_point.add(.{ .x = 0.023342, .y = -0.01 }), toMap(game.camera.position), 0.1))
                         {
                             break potential_spawn_point;
                         } else {
@@ -342,7 +342,7 @@ pub fn main() !void {
                     if (enemy.projectile_cooldown < 0 and
                         game.player_state == .alive)
                     {
-                        const found_wall_on_the_way = checkCollisionWithMap(map, enemy.pos, toMap(game.camera.position), 0.001);
+                        const found_wall_on_the_way = checkCollisionWithMap(map, enemy.pos, toMap(game.camera.position), 0.1);
                         if (!found_wall_on_the_way) {
                             if (game.particles.append(.{
                                 .type = .bullet,
